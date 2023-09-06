@@ -15,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pg-sharding/logproxy/config"
 	con "github.com/pg-sharding/spqr/pkg/conn"
-	"github.com/pg-sharding/spqr/pkg/spqrlog"
 )
 
 type Proxy struct {
@@ -63,7 +62,7 @@ func (p *Proxy) Run() error {
 
 	go accept(listener, cChan)
 
-	spqrlog.Zero.Info().Str("port %s", p.proxyPort).Msg("Proxy is up and listening")
+	log.Printf("Proxy is up and listening at %s", p.proxyPort)
 
 	for {
 		select {
@@ -73,7 +72,7 @@ func (p *Proxy) Run() error {
 		case c := <-cChan:
 			go func() {
 				if err := p.serv(c); err != nil {
-					spqrlog.Zero.Fatal().Err(err)
+					log.Fatal(err)
 				}
 			}()
 		}
@@ -135,7 +134,7 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 		case <-ctx.Done():
 			os.Exit(1)
 		case <-curt.C:
-			spqrlog.Zero.Debug().Any("msg %+v ", msg).Msg("sending")
+			log.Printf("msg %+v ", msg)
 		}
 
 		frontend.Send(msg)
@@ -162,7 +161,6 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 }
 
 func (p *Proxy) serv(netconn net.Conn) error {
-	log.Default().Println("start serving")
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", p.toHost, p.toPort))
 	if err != nil {
 		return err
@@ -170,14 +168,11 @@ func (p *Proxy) serv(netconn net.Conn) error {
 
 	frontend := pgproto3.NewFrontend(bufio.NewReader(conn), conn)
 
-	log.Default().Println("ok objavlenie")
 	//handle startup messages
 	cl, err := p.startup(netconn, frontend)
 	if err != nil {
-		log.Default().Println("startup not ok")
 		return err
 	}
-	log.Default().Println("startup ok")
 
 	defer p.Flush()
 
@@ -194,7 +189,7 @@ func (p *Proxy) serv(netconn net.Conn) error {
 		}
 		p.interceptedData = append(p.interceptedData, byt...)
 		if len(p.interceptedData) > 1000000 {
-			spqrlog.Zero.Debug().Msg("flushing buffer")
+			log.Println("flushing buffer")
 			err = p.Flush()
 			if err != nil {
 				return fmt.Errorf("failed to write to file %w", err)
@@ -222,7 +217,8 @@ func (p *Proxy) serv(netconn net.Conn) error {
 }
 
 func (p *Proxy) Flush() error {
-	spqrlog.Zero.Debug().Msg("flush")
+	log.Println("flush")
+
 	f, err := os.OpenFile(p.logFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
 		return err
@@ -312,11 +308,10 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 		}
 
 		protoVer := binary.BigEndian.Uint32(msg)
-		log.Default().Println("headers and versions ok")
 
 		switch protoVer {
 		case con.GSSREQ:
-			spqrlog.Zero.Debug().Msg("negotiate gss enc request")
+			log.Println("negotiate gss enc request")
 			_, err := netconn.Write([]byte{'N'})
 			if err != nil {
 				return nil, err
@@ -326,7 +321,7 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 
 		case con.SSLREQ: //TODO tls config
 			if p.tlsConf == nil {
-				log.Default().Println("tls is nil")
+				log.Default().Println("no tls provided")
 				_, err := netconn.Write([]byte{'N'})
 				if err != nil {
 					return nil, err
@@ -335,7 +330,6 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 				continue
 			}
 
-			log.Default().Println("wtf tls not nil")
 			_, err := netconn.Write([]byte{'S'})
 			if err != nil {
 				return nil, err
@@ -352,7 +346,6 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 
 			switch msg := frsm.(type) {
 			case *pgproto3.StartupMessage:
-				log.Default().Println("startup message")
 				frontend.Send(msg)
 				if err := frontend.Flush(); err != nil {
 					return nil, fmt.Errorf("failed to send msg to bd %w", err)
