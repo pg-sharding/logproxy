@@ -1,8 +1,9 @@
 package main
 
 import (
+	"log"
+
 	"github.com/pg-sharding/logproxy"
-	"github.com/pg-sharding/spqr/pkg/spqrlog"
 	"github.com/spf13/cobra"
 )
 
@@ -75,6 +76,6 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		spqrlog.Zero.Err(err).Msg("")
+		log.Fatal(err)
 	}
 }
