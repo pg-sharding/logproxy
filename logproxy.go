@@ -20,22 +20,24 @@ const SSLREQ = 80877103
 const GSSREQ = 80877104
 
 type Proxy struct {
-	toHost          string
-	toPort          string
-	proxyPort       string
-	logFileName     string
-	interceptedData []byte
-	tlsConf         *tls.Config
+	toHost      string
+	toPort      string
+	proxyPort   string
+	logFileName string
+	tlsConf     *tls.Config
+}
+
+type InterceptedData struct {
+	data []byte
 }
 
 func NewProxy(toHost string, toPort string, file string, proxyPort string, configPath string) Proxy {
 	return Proxy{
-		toHost:          toHost,
-		toPort:          toPort,
-		logFileName:     file,
-		proxyPort:       proxyPort,
-		interceptedData: []byte{},
-		tlsConf:         initTls(configPath),
+		toHost:      toHost,
+		toPort:      toPort,
+		logFileName: file,
+		proxyPort:   proxyPort,
+		tlsConf:     initTls(configPath),
 	}
 }
 
@@ -69,7 +71,6 @@ func (p *Proxy) Run() error {
 	for {
 		select {
 		case <-ctx.Done():
-			p.Flush()
 			os.Exit(1)
 		case c := <-cChan:
 			go func() {
@@ -166,6 +167,9 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 }
 
 func (p *Proxy) serv(netconn net.Conn) error {
+	interData := &InterceptedData{
+		data: []byte{},
+	}
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", p.toHost, p.toPort))
 	if err != nil {
 		return err
@@ -179,7 +183,7 @@ func (p *Proxy) serv(netconn net.Conn) error {
 		return err
 	}
 
-	defer p.Flush()
+	defer p.Flush(interData)
 
 	for {
 		msg, err := cl.Receive()
@@ -192,13 +196,14 @@ func (p *Proxy) serv(netconn net.Conn) error {
 		if err != nil {
 			return fmt.Errorf("failed to convert %w", err)
 		}
-		p.interceptedData = append(p.interceptedData, byt...)
-		if len(p.interceptedData) > 1000000 {
+		interData.data = append(interData.data, byt...)
+		if len(interData.data) > 1000000 {
 			log.Println("flushing buffer")
-			err = p.Flush()
+			err = p.Flush(interData)
 			if err != nil {
 				return fmt.Errorf("failed to write to file %w", err)
 			}
+			interData.data = []byte{}
 		}
 
 		//send to frontend
@@ -209,6 +214,7 @@ func (p *Proxy) serv(netconn net.Conn) error {
 
 		switch msg.(type) {
 		case *pgproto3.Terminate:
+			//err = p.Flush(interceptedData)
 			return nil
 		}
 
@@ -226,7 +232,7 @@ func (p *Proxy) serv(netconn net.Conn) error {
 	}
 }
 
-func (p *Proxy) Flush() error {
+func (p *Proxy) Flush(interceptedData *InterceptedData) error {
 	log.Println("flush")
 
 	f, err := os.OpenFile(p.logFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
@@ -235,7 +241,7 @@ func (p *Proxy) Flush() error {
 	}
 	defer f.Close()
 
-	_, err = f.Write(p.interceptedData)
+	_, err = f.Write(interceptedData.data)
 	if err != nil {
 		return err
 	}
@@ -405,7 +411,6 @@ func recieveBackend(frontend *pgproto3.Frontend, process func(pgproto3.BackendMe
 	for {
 		retmsg, err := frontend.Receive()
 		if err != nil {
-			log.Printf("error backend %T --- %+v", err, err)
 			return fmt.Errorf("failed to receive msg from db %w", err)
 		}
 
@@ -414,7 +419,6 @@ func recieveBackend(frontend *pgproto3.Frontend, process func(pgproto3.BackendMe
 			return err
 		}
 
-		log.Printf("%+v", retmsg)
 		if shouldStop(retmsg) {
 			return nil
 		}
