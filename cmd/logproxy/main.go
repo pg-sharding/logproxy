@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/pg-sharding/logproxy"
 	"github.com/pg-sharding/spqr/pkg/spqrlog"
-	"github.com/pg-sharding/spqr/test/logproxy"
 	"github.com/spf13/cobra"
 )
 

@@ -305,7 +305,7 @@ func startup(netconn net.Conn, frontend *pgproto3.Frontend, cl *pgproto3.Backend
 			}
 			continue
 
-		case con.SSLREQ:
+		case con.SSLREQ: //TODO tls config
 			_, err := netconn.Write([]byte{'N'})
 			if err != nil {
 				return err
