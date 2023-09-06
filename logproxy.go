@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/pg-sharding/logproxy/config"
 	con "github.com/pg-sharding/spqr/pkg/conn"
 	"github.com/pg-sharding/spqr/pkg/spqrlog"
 )
@@ -26,13 +27,14 @@ type Proxy struct {
 	tlsConf         *tls.Config
 }
 
-func NewProxy(toHost string, toPort string, file string, proxyPort string) Proxy {
+func NewProxy(toHost string, toPort string, file string, proxyPort string, configPath string) Proxy {
 	return Proxy{
 		toHost:          toHost,
 		toPort:          toPort,
 		logFileName:     file,
 		proxyPort:       proxyPort,
 		interceptedData: []byte{},
+		tlsConf:         initTls(configPath),
 	}
 }
 
@@ -76,6 +78,14 @@ func (p *Proxy) Run() error {
 			}()
 		}
 	}
+}
+
+func initTls(path string) *tls.Config {
+	conf, err := config.LoadTlsCfg(path)
+	if err != nil {
+		return nil
+	}
+	return conf
 }
 
 func ReplayLogs(host string, port string, user string, db string, file string) error {
