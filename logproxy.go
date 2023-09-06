@@ -3,9 +3,11 @@ package logproxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"time"
@@ -21,6 +23,7 @@ type Proxy struct {
 	proxyPort       string
 	logFileName     string
 	interceptedData []byte
+	tlsConf         *tls.Config
 }
 
 func NewProxy(toHost string, toPort string, file string, proxyPort string) Proxy {
@@ -149,18 +152,22 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 }
 
 func (p *Proxy) serv(netconn net.Conn) error {
+	log.Default().Println("start serving")
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", p.toHost, p.toPort))
 	if err != nil {
 		return err
 	}
 
 	frontend := pgproto3.NewFrontend(bufio.NewReader(conn), conn)
-	cl := pgproto3.NewBackend(bufio.NewReader(netconn), netconn)
 
+	log.Default().Println("ok objavlenie")
 	//handle startup messages
-	if err = startup(netconn, frontend, cl); err != nil {
+	cl, err := p.startup(netconn, frontend)
+	if err != nil {
+		log.Default().Println("startup not ok")
 		return err
 	}
+	log.Default().Println("startup ok")
 
 	defer p.Flush()
 
@@ -278,12 +285,12 @@ func parseFile(f *os.File) (time.Time, pgproto3.FrontendMessage, error) {
 	return ti, fm, nil
 }
 
-func startup(netconn net.Conn, frontend *pgproto3.Frontend, cl *pgproto3.Backend) error {
+func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto3.Backend, error) {
 	for {
 		headerRaw := make([]byte, 4)
 		_, err := netconn.Read(headerRaw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		msgSize := int(binary.BigEndian.Uint32(headerRaw) - 4)
@@ -291,38 +298,79 @@ func startup(netconn net.Conn, frontend *pgproto3.Frontend, cl *pgproto3.Backend
 
 		_, err = netconn.Read(msg)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		protoVer := binary.BigEndian.Uint32(msg)
+		log.Default().Println("headers and versions ok")
 
 		switch protoVer {
 		case con.GSSREQ:
 			spqrlog.Zero.Debug().Msg("negotiate gss enc request")
 			_, err := netconn.Write([]byte{'N'})
 			if err != nil {
-				return err
+				return nil, err
 			}
+			// proceed next iter, for protocol version number or GSSAPI interaction
 			continue
 
 		case con.SSLREQ: //TODO tls config
-			_, err := netconn.Write([]byte{'N'})
-			if err != nil {
-				return err
+			if p.tlsConf == nil {
+				log.Default().Println("tls is nil")
+				_, err := netconn.Write([]byte{'N'})
+				if err != nil {
+					return nil, err
+				}
+				// proceed next iter, for protocol version number or GSSAPI interaction
+				continue
 			}
-			//TODO add tls config
-			continue
+
+			log.Default().Println("wtf tls not nil")
+			_, err := netconn.Write([]byte{'S'})
+			if err != nil {
+				return nil, err
+			}
+
+			netconn = tls.Server(netconn, p.tlsConf)
+
+			backend := pgproto3.NewBackend(bufio.NewReader(netconn), netconn)
+
+			frsm, err := backend.ReceiveStartupMessage()
+			if err != nil {
+				return nil, err
+			}
+
+			switch msg := frsm.(type) {
+			case *pgproto3.StartupMessage:
+				log.Default().Println("startup message")
+				frontend.Send(msg)
+				if err := frontend.Flush(); err != nil {
+					return nil, fmt.Errorf("failed to send msg to bd %w", err)
+				}
+				proc := func(msg pgproto3.BackendMessage) error {
+					backend.Send(msg)
+					if err := backend.Flush(); err != nil {
+						return fmt.Errorf("failed to send msg to client %w", err)
+					}
+					return nil
+				}
+				err = recieveBackend(frontend, proc)
+				return backend, err
+			default:
+				return nil, fmt.Errorf("received unexpected message type %T", frsm)
+			}
 
 		case pgproto3.ProtocolVersionNumber:
+			cl := pgproto3.NewBackend(bufio.NewReader(netconn), netconn)
 			sm := &pgproto3.StartupMessage{}
 			err = sm.Decode(msg)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			frontend.Send(sm)
 			if err := frontend.Flush(); err != nil {
-				return fmt.Errorf("failed to send msg to bd %w", err)
+				return nil, fmt.Errorf("failed to send msg to bd %w", err)
 			}
 			proc := func(msg pgproto3.BackendMessage) error {
 				cl.Send(msg)
@@ -332,10 +380,10 @@ func startup(netconn net.Conn, frontend *pgproto3.Frontend, cl *pgproto3.Backend
 				return nil
 			}
 			err = recieveBackend(frontend, proc)
-			return err
+			return cl, err
 
 		default:
-			return fmt.Errorf("protocol number %d not supported", protoVer)
+			return nil, fmt.Errorf("protocol number %d not supported", protoVer)
 		}
 	}
 }
