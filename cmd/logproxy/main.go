@@ -1,8 +1,8 @@
 package main
 
 import (
+	"github.com/pg-sharding/logproxy"
 	"github.com/pg-sharding/spqr/pkg/spqrlog"
-	"github.com/pg-sharding/spqr/test/logproxy"
 	"github.com/spf13/cobra"
 )
 
@@ -12,6 +12,7 @@ var (
 	runPort      string
 	runLogFile   string
 	runProxyPort string
+	runConfig    string
 
 	//replay cmd
 	host   string
@@ -34,7 +35,7 @@ var startProxySessionCmd = &cobra.Command{
 	Use:   "run",
 	Short: "start proxy log writing session",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		prox := logproxy.NewProxy(runHost, runPort, runLogFile, runProxyPort)
+		prox := logproxy.NewProxy(runHost, runPort, runLogFile, runProxyPort, runConfig)
 		err := prox.Run()
 		return err
 	},
@@ -58,6 +59,7 @@ func init() {
 	startProxySessionCmd.PersistentFlags().StringVarP(&runPort, "port", "p", "5432", `database server port (default: 5432)`)
 	startProxySessionCmd.PersistentFlags().StringVarP(&runLogFile, "logfile", "l", "mylog.txt", `file to save logs`)
 	startProxySessionCmd.PersistentFlags().StringVarP(&runProxyPort, "proxyport", "P", "5433", `proxy port (default: 5433)`)
+	startProxySessionCmd.PersistentFlags().StringVarP(&runConfig, "config", "c", "", `tls config path`)
 
 	replayLogsCmd.PersistentFlags().StringVarP(&host, "host", "H", "localhost", `database server host (default: "localhost")`)
 	replayLogsCmd.PersistentFlags().StringVarP(&port, "port", "p", "5432", `database server port (default: 5432)`)
