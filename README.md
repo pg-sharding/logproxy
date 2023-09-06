@@ -11,7 +11,7 @@ Logproxy is a tool for recording and replaying test queries.
 
 To start querry collecting session:
 ```
-logproxy run -H bdHost -p bdPort -l LogFile
+logproxy run -H bdHost -p bdPort -l LogFile -P proxyPort -c tlsConfigPath
 ```
 To connect use:
 ```

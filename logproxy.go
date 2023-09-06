@@ -14,8 +14,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/pg-sharding/logproxy/config"
-	con "github.com/pg-sharding/spqr/pkg/conn"
 )
+
+const SSLREQ = 80877103
+const GSSREQ = 80877104
 
 type Proxy struct {
 	toHost          string
@@ -87,6 +89,9 @@ func initTls(path string) *tls.Config {
 	return conf
 }
 
+/*
+Parses file fith stored queries to fist Terminate message and sends it to db
+*/
 func ReplayLogs(host string, port string, user string, db string, file string) error {
 	ctx := context.Background()
 
@@ -202,6 +207,11 @@ func (p *Proxy) serv(netconn net.Conn) error {
 			return fmt.Errorf("failed to send msg to bd %w", err)
 		}
 
+		switch msg.(type) {
+		case *pgproto3.Terminate:
+			return nil
+		}
+
 		proc := func(msg pgproto3.BackendMessage) error {
 			cl.Send(msg)
 			if err := cl.Flush(); err != nil {
@@ -310,7 +320,7 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 		protoVer := binary.BigEndian.Uint32(msg)
 
 		switch protoVer {
-		case con.GSSREQ:
+		case GSSREQ:
 			log.Println("negotiate gss enc request")
 			_, err := netconn.Write([]byte{'N'})
 			if err != nil {
@@ -319,7 +329,7 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 			// proceed next iter, for protocol version number or GSSAPI interaction
 			continue
 
-		case con.SSLREQ: //TODO tls config
+		case SSLREQ: //TODO tls config
 			if p.tlsConf == nil {
 				log.Default().Println("no tls provided")
 				_, err := netconn.Write([]byte{'N'})
@@ -395,6 +405,7 @@ func recieveBackend(frontend *pgproto3.Frontend, process func(pgproto3.BackendMe
 	for {
 		retmsg, err := frontend.Receive()
 		if err != nil {
+			log.Printf("error backend %T --- %+v", err, err)
 			return fmt.Errorf("failed to receive msg from db %w", err)
 		}
 
@@ -403,6 +414,7 @@ func recieveBackend(frontend *pgproto3.Frontend, process func(pgproto3.BackendMe
 			return err
 		}
 
+		log.Printf("%+v", retmsg)
 		if shouldStop(retmsg) {
 			return nil
 		}
