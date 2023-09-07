@@ -48,7 +48,7 @@ var replayLogsCmd = &cobra.Command{
 	Use:   "replay",
 	Short: "replay written logs to db",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := logproxy.ReplayLogs(host, port, user, dbname, file)
+		err := logproxy.Newreplay(host, port, user, dbname, file)
 		return err
 	},
 	SilenceUsage:  false,
