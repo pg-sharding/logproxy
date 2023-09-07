@@ -31,6 +31,12 @@ type InterceptedData struct {
 	data []byte
 }
 
+type TimedMessage struct {
+	timestamp time.Time
+	msg       pgproto3.FrontendMessage
+	session   int
+}
+
 func NewProxy(toHost string, toPort string, file string, proxyPort string, configPath string) Proxy {
 	return Proxy{
 		toHost:      toHost,
@@ -68,13 +74,15 @@ func (p *Proxy) Run() error {
 
 	log.Printf("Proxy is up and listening at %s", p.proxyPort)
 
+	sessionNum := 0
 	for {
 		select {
 		case <-ctx.Done():
 			os.Exit(1)
 		case c := <-cChan:
 			go func() {
-				if err := p.serv(c); err != nil {
+				sessionNum++
+				if err := p.serv(c, sessionNum); err != nil {
 					log.Fatal(err)
 				}
 			}()
@@ -126,7 +134,8 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 	defer f.Close()
 
 	var curt time.Timer
-	tim, msg, err := parseFile(f)
+	stru, err := parseFile(f)
+	tim, msg := stru.timestamp, stru.msg
 	if err != nil {
 		if err == io.EOF {
 			return nil
@@ -152,7 +161,8 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 			return err
 		}
 
-		tim, msg, err = parseFile(f)
+		stru, err = parseFile(f)
+		tim, msg = stru.timestamp, stru.msg
 		if err != nil {
 			if err == io.EOF {
 				frontend.SendClose(&pgproto3.Close{})
@@ -166,8 +176,103 @@ func ReplayLogs(host string, port string, user string, db string, file string) e
 	}
 }
 
-func (p *Proxy) serv(netconn net.Conn) error {
-	interData := &InterceptedData{
+func Newreplay(host string, port string, user string, db string, file string) error {
+	//open file and read message
+	log.Println("started")
+	f, err := os.OpenFile(file, os.O_RDONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	ses := map[int](chan TimedMessage){}
+	log.Println("prep ok")
+
+	for {
+		//read next
+		stru, err := parseFile(f)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		log.Printf("session %d\n", stru.session)
+		// if session not exist, reate
+		if _, ok := ses[stru.session]; !ok {
+			log.Println("creating new session")
+			ses[stru.session] = make(chan TimedMessage)
+			go smthsession(host, port, user, db, ses[stru.session])
+		}
+
+		//send to session
+		log.Println("put to chan")
+		log.Printf("msg %+v ", stru.msg)
+		ses[stru.session] <- stru
+		log.Println("put to chanok")
+	}
+}
+
+func smthsession(host string, port string, user string, db string, ch chan TimedMessage) error {
+	ctx := context.Background()
+
+	startupMessage := &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersionNumber,
+		Parameters: map[string]string{
+			"user":     user,
+			"database": db,
+		},
+	}
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+	if err != nil {
+		return fmt.Errorf("failed to establish connection to host %s - %w", fmt.Sprintf("%s:%s", host, port), err)
+	}
+
+	frontend := pgproto3.NewFrontend(bufio.NewReader(conn), conn)
+
+	frontend.Send(startupMessage)
+	if err := frontend.Flush(); err != nil {
+		return fmt.Errorf("failed to send msg to bd %w", err)
+	}
+	err = recieveBackend(frontend, func(msg pgproto3.BackendMessage) error { return nil })
+	if err != nil {
+		return err
+	}
+
+	var tm TimedMessage
+	var prevT, prevMsgT time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			os.Exit(1)
+		case tm = <-ch:
+			tem := time.Now()
+			timer := time.NewTimer(tm.timestamp.Sub(prevMsgT) - tem.Sub(prevT))
+			prevT = tem
+			prevMsgT = tm.timestamp
+			<-timer.C
+
+			//log.Printf("msg %+v ", tm.msg)
+			frontend.Send(tm.msg)
+			if err := frontend.Flush(); err != nil {
+				return fmt.Errorf("failed to send msg to bd %w", err)
+			}
+			switch tm.msg.(type) {
+			case *pgproto3.Terminate:
+				return nil
+			default:
+				err = recieveBackend(frontend, func(msg pgproto3.BackendMessage) error { return nil })
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+func (p *Proxy) serv(netconn net.Conn, session int) error {
+	interData := &InterceptedData{ //TODO common buffer
 		data: []byte{},
 	}
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", p.toHost, p.toPort))
@@ -192,7 +297,7 @@ func (p *Proxy) serv(netconn net.Conn) error {
 		}
 
 		//writing request data to buffer
-		byt, err := encodeMessage(msg)
+		byt, err := encodeMessage(msg, session)
 		if err != nil {
 			return fmt.Errorf("failed to convert %w", err)
 		}
@@ -249,30 +354,46 @@ func (p *Proxy) Flush(interceptedData *InterceptedData) error {
 	return nil
 }
 
-func parseFile(f *os.File) (time.Time, pgproto3.FrontendMessage, error) {
+func parseFile(f *os.File) (TimedMessage, error) {
 	// 15 byte - timestamp
+	// 4 bytes - session number
 	// 1 byte - message header
 	// 4 bytes - message length (except header)
 	// ?? bytes - message bytes
+
+	tm := TimedMessage{
+		timestamp: time.Now(),
+		msg:       nil,
+	}
 
 	//timestamp
 	timeb := make([]byte, 15)
 	_, err := f.Read(timeb) //err
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
 	var ti time.Time
 	err = ti.UnmarshalBinary(timeb)
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
+
+	//session
+	rawSes := make([]byte, 4)
+
+	_, err = f.Read(rawSes)
+	if err != nil {
+		return tm, err
+	}
+
+	ses := int(binary.BigEndian.Uint32(rawSes) - 4)
 
 	//header
 	tip := make([]byte, 1)
 
 	_, err = f.Read(tip)
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
 
 	//size
@@ -280,7 +401,7 @@ func parseFile(f *os.File) (time.Time, pgproto3.FrontendMessage, error) {
 
 	_, err = f.Read(rawSize)
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
 
 	msgSize := int(binary.BigEndian.Uint32(rawSize) - 4)
@@ -289,7 +410,7 @@ func parseFile(f *os.File) (time.Time, pgproto3.FrontendMessage, error) {
 	msg := make([]byte, msgSize)
 	_, err = f.Read(msg)
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
 
 	var fm pgproto3.FrontendMessage
@@ -297,14 +418,18 @@ func parseFile(f *os.File) (time.Time, pgproto3.FrontendMessage, error) {
 	case "Q":
 		fm = &pgproto3.Query{}
 	case "X":
-		return time.Now(), nil, io.EOF
+		fm = &pgproto3.Terminate{}
 	}
 	err = fm.Decode(msg)
 	if err != nil {
-		return time.Now(), nil, err
+		return tm, err
 	}
 
-	return ti, fm, nil
+	tm.timestamp = ti
+	tm.msg = fm
+	tm.session = ses
+
+	return tm, nil
 }
 
 func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto3.Backend, error) {
@@ -335,7 +460,7 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 			// proceed next iter, for protocol version number or GSSAPI interaction
 			continue
 
-		case SSLREQ: //TODO tls config
+		case SSLREQ:
 			if p.tlsConf == nil {
 				log.Default().Println("no tls provided")
 				_, err := netconn.Write([]byte{'N'})
@@ -437,11 +562,12 @@ func shouldStop(msg pgproto3.BackendMessage) bool {
 /*
 Gets pgproto3.FrontendMessage and encodes it in binary with timestamp.
 15 byte - timestamp
+4 bytes - session number
 1 byte - message header
 4 bytes - message length (except header)
 ?? bytes - message bytes
 */
-func encodeMessage(msg pgproto3.FrontendMessage) ([]byte, error) {
+func encodeMessage(msg pgproto3.FrontendMessage, session int) ([]byte, error) {
 	b2 := msg.Encode(nil)
 
 	t := time.Now()
@@ -450,6 +576,10 @@ func encodeMessage(msg pgproto3.FrontendMessage) ([]byte, error) {
 		return nil, err
 	}
 
-	compl := append(tb, b2...)
+	bs := make([]byte, 4)
+	binary.BigEndian.PutUint32(bs, uint32(session))
+
+	compl := append(tb, bs...)
+	compl = append(compl, b2...)
 	return compl, nil
 }
