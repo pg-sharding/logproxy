@@ -101,84 +101,7 @@ func initTls(path string) *tls.Config {
 /*
 Parses file fith stored queries to fist Terminate message and sends it to db
 */
-func ReplayLogs(host string, port string, user string, db string, file string) error {
-	ctx := context.Background()
-
-	startupMessage := &pgproto3.StartupMessage{
-		ProtocolVersion: pgproto3.ProtocolVersionNumber,
-		Parameters: map[string]string{
-			"user":     user,
-			"database": db,
-		},
-	}
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
-	if err != nil {
-		return fmt.Errorf("failed to establish connection to host %s - %w", fmt.Sprintf("%s:%s", host, port), err)
-	}
-
-	frontend := pgproto3.NewFrontend(bufio.NewReader(conn), conn)
-
-	frontend.Send(startupMessage)
-	if err := frontend.Flush(); err != nil {
-		return fmt.Errorf("failed to send msg to bd %w", err)
-	}
-	err = recieveBackend(frontend, func(msg pgproto3.BackendMessage) error { return nil })
-	if err != nil {
-		return err
-	}
-
-	f, err := os.OpenFile(file, os.O_RDONLY, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	var curt time.Timer
-	stru, err := parseFile(f)
-	tim, msg := stru.timestamp, stru.msg
-	if err != nil {
-		if err == io.EOF {
-			return nil
-		}
-		return err
-	}
-	prevT := tim
-	curt = *time.NewTimer(tim.Sub(tim))
-	for {
-		select {
-		case <-ctx.Done():
-			os.Exit(1)
-		case <-curt.C:
-			log.Printf("msg %+v ", msg)
-		}
-
-		frontend.Send(msg)
-		if err := frontend.Flush(); err != nil {
-			return fmt.Errorf("failed to send msg to bd %w", err)
-		}
-		err = recieveBackend(frontend, func(msg pgproto3.BackendMessage) error { return nil })
-		if err != nil {
-			return err
-		}
-
-		stru, err = parseFile(f)
-		tim, msg = stru.timestamp, stru.msg
-		if err != nil {
-			if err == io.EOF {
-				frontend.SendClose(&pgproto3.Close{})
-				return nil
-			}
-			return err
-		}
-
-		curt = *time.NewTimer(tim.Sub(prevT))
-		prevT = tim
-	}
-}
-
 func Newreplay(host string, port string, user string, db string, file string) error {
-	//open file and read message
-	log.Println("started")
 	f, err := os.OpenFile(file, os.O_RDONLY, 0600)
 	if err != nil {
 		return err
@@ -186,7 +109,6 @@ func Newreplay(host string, port string, user string, db string, file string) er
 	defer f.Close()
 
 	ses := map[int](chan TimedMessage){}
-	log.Println("prep ok")
 
 	for {
 		//read next
@@ -199,18 +121,14 @@ func Newreplay(host string, port string, user string, db string, file string) er
 		}
 
 		log.Printf("session %d\n", stru.session)
-		// if session not exist, reate
+		// if session not exist, create
 		if _, ok := ses[stru.session]; !ok {
-			log.Println("creating new session")
 			ses[stru.session] = make(chan TimedMessage)
 			go smthsession(host, port, user, db, ses[stru.session])
 		}
 
 		//send to session
-		log.Println("put to chan")
-		log.Printf("msg %+v ", stru.msg)
 		ses[stru.session] <- stru
-		log.Println("put to chanok")
 	}
 }
 
@@ -253,7 +171,7 @@ func smthsession(host string, port string, user string, db string, ch chan Timed
 			prevMsgT = tm.timestamp
 			<-timer.C
 
-			//log.Printf("msg %+v ", tm.msg)
+			log.Printf("msg %+v ", tm.msg)
 			frontend.Send(tm.msg)
 			if err := frontend.Flush(); err != nil {
 				return fmt.Errorf("failed to send msg to bd %w", err)
@@ -272,7 +190,7 @@ func smthsession(host string, port string, user string, db string, ch chan Timed
 }
 
 func (p *Proxy) serv(netconn net.Conn, session int) error {
-	interData := &InterceptedData{ //TODO common buffer
+	interData := &InterceptedData{
 		data: []byte{},
 	}
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", p.toHost, p.toPort))
@@ -303,7 +221,6 @@ func (p *Proxy) serv(netconn net.Conn, session int) error {
 		}
 		interData.data = append(interData.data, byt...)
 		if len(interData.data) > 1000000 {
-			log.Println("flushing buffer")
 			err = p.Flush(interData)
 			if err != nil {
 				return fmt.Errorf("failed to write to file %w", err)
@@ -386,7 +303,7 @@ func parseFile(f *os.File) (TimedMessage, error) {
 		return tm, err
 	}
 
-	ses := int(binary.BigEndian.Uint32(rawSes) - 4)
+	sesNum := int(binary.BigEndian.Uint32(rawSes) - 4)
 
 	//header
 	tip := make([]byte, 1)
@@ -427,7 +344,7 @@ func parseFile(f *os.File) (TimedMessage, error) {
 
 	tm.timestamp = ti
 	tm.msg = fm
-	tm.session = ses
+	tm.session = sesNum
 
 	return tm, nil
 }
@@ -480,12 +397,12 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 
 			backend := pgproto3.NewBackend(bufio.NewReader(netconn), netconn)
 
-			frsm, err := backend.ReceiveStartupMessage()
+			startupMsg, err := backend.ReceiveStartupMessage()
 			if err != nil {
 				return nil, err
 			}
 
-			switch msg := frsm.(type) {
+			switch msg := startupMsg.(type) {
 			case *pgproto3.StartupMessage:
 				frontend.Send(msg)
 				if err := frontend.Flush(); err != nil {
@@ -501,18 +418,18 @@ func (p *Proxy) startup(netconn net.Conn, frontend *pgproto3.Frontend) (*pgproto
 				err = recieveBackend(frontend, proc)
 				return backend, err
 			default:
-				return nil, fmt.Errorf("received unexpected message type %T", frsm)
+				return nil, fmt.Errorf("received unexpected message type %T", startupMsg)
 			}
 
 		case pgproto3.ProtocolVersionNumber:
 			cl := pgproto3.NewBackend(bufio.NewReader(netconn), netconn)
-			sm := &pgproto3.StartupMessage{}
-			err = sm.Decode(msg)
+			startMsg := &pgproto3.StartupMessage{}
+			err = startMsg.Decode(msg)
 			if err != nil {
 				return nil, err
 			}
 
-			frontend.Send(sm)
+			frontend.Send(startMsg)
 			if err := frontend.Flush(); err != nil {
 				return nil, fmt.Errorf("failed to send msg to bd %w", err)
 			}
@@ -568,18 +485,18 @@ Gets pgproto3.FrontendMessage and encodes it in binary with timestamp.
 ?? bytes - message bytes
 */
 func encodeMessage(msg pgproto3.FrontendMessage, session int) ([]byte, error) {
-	b2 := msg.Encode(nil)
+	binMsg := msg.Encode(nil)
 
 	t := time.Now()
-	tb, err := t.MarshalBinary()
+	binTime, err := t.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
 
-	bs := make([]byte, 4)
-	binary.BigEndian.PutUint32(bs, uint32(session))
+	binSessionNum := make([]byte, 4)
+	binary.BigEndian.PutUint32(binSessionNum, uint32(session))
 
-	compl := append(tb, bs...)
-	compl = append(compl, b2...)
+	compl := append(binTime, binSessionNum...)
+	compl = append(compl, binMsg...)
 	return compl, nil
 }
