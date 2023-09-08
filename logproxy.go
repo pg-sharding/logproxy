@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -27,6 +28,7 @@ type Proxy struct {
 	tlsConf     *tls.Config
 }
 
+// used to make defer with changing byte arrays
 type InterceptedData struct {
 	data []byte
 }
@@ -47,9 +49,7 @@ func NewProxy(toHost string, toPort string, file string, proxyPort string, confi
 	}
 }
 
-func (p *Proxy) Run() error {
-	ctx := context.Background()
-
+func (p *Proxy) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp6", fmt.Sprintf("[::1]:%s", p.proxyPort))
 	if err != nil {
 		return fmt.Errorf("failed to start proxy %w", err)
@@ -75,14 +75,19 @@ func (p *Proxy) Run() error {
 	log.Printf("Proxy is up and listening at %s", p.proxyPort)
 
 	sessionNum := 0
+	wg := sync.WaitGroup{}
 	for {
 		select {
 		case <-ctx.Done():
-			os.Exit(1)
+			wg.Wait()
+			return nil
 		case c := <-cChan:
+			wg.Add(1)
 			go func() {
+				log.Printf("recieved new session")
+				defer wg.Done()
 				sessionNum++
-				if err := p.serv(c, sessionNum); err != nil {
+				if err := p.serv(c, sessionNum, ctx); err != nil {
 					log.Fatal(err)
 				}
 			}()
@@ -101,18 +106,18 @@ func initTls(path string) *tls.Config {
 /*
 Parses file fith stored queries to fist Terminate message and sends it to db
 */
-func Newreplay(host string, port string, user string, db string, file string) error {
+func ReplayLogs(host string, port string, user string, db string, file string) error {
 	f, err := os.OpenFile(file, os.O_RDONLY, 0600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	ses := map[int](chan TimedMessage){}
+	sessionsMessageBuffer := map[int](chan TimedMessage){}
 
 	for {
 		//read next
-		stru, err := parseFile(f)
+		msg, err := parseFile(f)
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -120,19 +125,19 @@ func Newreplay(host string, port string, user string, db string, file string) er
 			return err
 		}
 
-		log.Printf("session %d\n", stru.session)
+		log.Printf("session %d\n", msg.session)
 		// if session not exist, create
-		if _, ok := ses[stru.session]; !ok {
-			ses[stru.session] = make(chan TimedMessage)
-			go smthsession(host, port, user, db, ses[stru.session])
+		if _, ok := sessionsMessageBuffer[msg.session]; !ok {
+			sessionsMessageBuffer[msg.session] = make(chan TimedMessage)
+			go startNewSession(host, port, user, db, sessionsMessageBuffer[msg.session])
 		}
 
 		//send to session
-		ses[stru.session] <- stru
+		sessionsMessageBuffer[msg.session] <- msg
 	}
 }
 
-func smthsession(host string, port string, user string, db string, ch chan TimedMessage) error {
+func startNewSession(host string, port string, user string, db string, ch chan TimedMessage) error {
 	ctx := context.Background()
 
 	startupMessage := &pgproto3.StartupMessage{
@@ -159,16 +164,16 @@ func smthsession(host string, port string, user string, db string, ch chan Timed
 	}
 
 	var tm TimedMessage
-	var prevT, prevMsgT time.Time
+	var prevSentTime, prevMsgTime time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			os.Exit(1)
 		case tm = <-ch:
-			tem := time.Now()
-			timer := time.NewTimer(tm.timestamp.Sub(prevMsgT) - tem.Sub(prevT))
-			prevT = tem
-			prevMsgT = tm.timestamp
+			timeNow := time.Now()
+			timer := time.NewTimer(tm.timestamp.Sub(prevMsgTime) - timeNow.Sub(prevSentTime))
+			prevSentTime = timeNow
+			prevMsgTime = tm.timestamp
 			<-timer.C
 
 			log.Printf("msg %+v ", tm.msg)
@@ -189,7 +194,7 @@ func smthsession(host string, port string, user string, db string, ch chan Timed
 	}
 }
 
-func (p *Proxy) serv(netconn net.Conn, session int) error {
+func (p *Proxy) serv(netconn net.Conn, session int, ctx context.Context) error {
 	interData := &InterceptedData{
 		data: []byte{},
 	}
@@ -209,10 +214,18 @@ func (p *Proxy) serv(netconn net.Conn, session int) error {
 	defer p.Flush(interData)
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.Println("context done")
+			return nil
+		default:
+		}
 		msg, err := cl.Receive()
 		if err != nil {
 			return fmt.Errorf("failed to receive msg from client %w", err)
 		}
+
+		log.Printf("client message: %+v", msg)
 
 		//writing request data to buffer
 		byt, err := encodeMessage(msg, session)
@@ -236,11 +249,11 @@ func (p *Proxy) serv(netconn net.Conn, session int) error {
 
 		switch msg.(type) {
 		case *pgproto3.Terminate:
-			//err = p.Flush(interceptedData)
 			return nil
 		}
 
 		proc := func(msg pgproto3.BackendMessage) error {
+			log.Printf("ans: %+v", msg)
 			cl.Send(msg)
 			if err := cl.Flush(); err != nil {
 				return fmt.Errorf("failed to send msg to client %w", err)
@@ -285,7 +298,7 @@ func parseFile(f *os.File) (TimedMessage, error) {
 
 	//timestamp
 	timeb := make([]byte, 15)
-	_, err := f.Read(timeb) //err
+	_, err := f.Read(timeb)
 	if err != nil {
 		return tm, err
 	}

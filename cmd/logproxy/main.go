@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/pg-sharding/logproxy"
@@ -36,8 +37,9 @@ var startProxySessionCmd = &cobra.Command{
 	Use:   "run",
 	Short: "start proxy log writing session",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background()
 		prox := logproxy.NewProxy(runHost, runPort, runLogFile, runProxyPort, runConfig)
-		err := prox.Run()
+		err := prox.Run(ctx)
 		return err
 	},
 	SilenceUsage:  false,
@@ -48,7 +50,7 @@ var replayLogsCmd = &cobra.Command{
 	Use:   "replay",
 	Short: "replay written logs to db",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := logproxy.Newreplay(host, port, user, dbname, file)
+		err := logproxy.ReplayLogs(host, port, user, dbname, file)
 		return err
 	},
 	SilenceUsage:  false,
