@@ -104,7 +104,7 @@ func TestProxyPeplaysLogs(t *testing.T) {
 	_, err = connDb.Exec(context.Background(), "CREATE DATABASE db2")
 	assert.NoError(err)
 
-	err = logproxy.Newreplay("localhost", "5434", "myuser", "db2", "logFiles/test_replay.txt")
+	err = logproxy.ReplayLogs("localhost", "5434", "myuser", "db2", "logFiles/test_replay.txt")
 	assert.NoError(err)
 
 	_, err = connDb.Exec(context.Background(), "SELECT * FROM test")
