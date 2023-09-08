@@ -79,9 +79,7 @@ func (p *Proxy) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("global context done")
 			wg.Wait()
-			//os.Exit(1)
 			return nil
 		case c := <-cChan:
 			wg.Add(1)
