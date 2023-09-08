@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -47,9 +48,7 @@ func NewProxy(toHost string, toPort string, file string, proxyPort string, confi
 	}
 }
 
-func (p *Proxy) Run() error {
-	ctx := context.Background()
-
+func (p *Proxy) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp6", fmt.Sprintf("[::1]:%s", p.proxyPort))
 	if err != nil {
 		return fmt.Errorf("failed to start proxy %w", err)
@@ -75,14 +74,21 @@ func (p *Proxy) Run() error {
 	log.Printf("Proxy is up and listening at %s", p.proxyPort)
 
 	sessionNum := 0
+	wg := sync.WaitGroup{}
 	for {
 		select {
 		case <-ctx.Done():
-			os.Exit(1)
+			log.Println("global context done")
+			wg.Wait()
+			//os.Exit(1)
+			return nil
 		case c := <-cChan:
+			wg.Add(1)
 			go func() {
+				log.Printf("recieved new session")
+				defer wg.Done()
 				sessionNum++
-				if err := p.serv(c, sessionNum); err != nil {
+				if err := p.serv(c, sessionNum, ctx); err != nil {
 					log.Fatal(err)
 				}
 			}()
@@ -189,7 +195,7 @@ func smthsession(host string, port string, user string, db string, ch chan Timed
 	}
 }
 
-func (p *Proxy) serv(netconn net.Conn, session int) error {
+func (p *Proxy) serv(netconn net.Conn, session int, ctx context.Context) error {
 	interData := &InterceptedData{
 		data: []byte{},
 	}
@@ -209,10 +215,18 @@ func (p *Proxy) serv(netconn net.Conn, session int) error {
 	defer p.Flush(interData)
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.Println("context done")
+			return nil
+		default:
+		}
 		msg, err := cl.Receive()
 		if err != nil {
 			return fmt.Errorf("failed to receive msg from client %w", err)
 		}
+
+		log.Printf("client message: %+v", msg)
 
 		//writing request data to buffer
 		byt, err := encodeMessage(msg, session)
@@ -241,6 +255,7 @@ func (p *Proxy) serv(netconn net.Conn, session int) error {
 		}
 
 		proc := func(msg pgproto3.BackendMessage) error {
+			log.Printf("ans: %+v", msg)
 			cl.Send(msg)
 			if err := cl.Flush(); err != nil {
 				return fmt.Errorf("failed to send msg to client %w", err)
